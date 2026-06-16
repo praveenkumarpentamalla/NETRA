@@ -151,3 +151,8 @@ I've thoroughly read the Project NETRA document. This is an extraordinarily comp
 ---
 
 ## PART 3 — MICROSERVICE ARCHITECTURENow let me generate the complete source code files. Given the scale of this project, I'll build everything systematically:Now let me build the complete codebase:## PART 4 — DATABASE DESIGN
+
+
+<img width="1440" height="1520" alt="image" src="https://github.com/user-attachments/assets/ab87707e-cc32-4987-a919-945b653cd11f" />
+
+<img width="1440" height="1188" alt="image" src="https://github.com/user-attachments/assets/ba365375-4a1b-4ba2-9ec7-f7ad06457325" />
