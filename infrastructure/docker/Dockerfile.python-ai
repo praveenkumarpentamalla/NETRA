@@ -1,0 +1,42 @@
+# ──────────────────────────────────────────────────────────────
+# Project NETRA — Python AI Service Dockerfile
+# GPU-capable; falls back gracefully to CPU.
+# ──────────────────────────────────────────────────────────────
+
+FROM nvidia/cuda:12.3.1-cudnn8-runtime-ubuntu22.04 AS base
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3-pip \
+    libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    libgomp1 libgl1-mesa-glx libglib2.0-dev \
+    ffmpeg libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -s /usr/bin/python3.11 /usr/bin/python
+
+# Create non-root user
+RUN addgroup --gid 1001 netra && adduser --uid 1001 --gid 1001 --disabled-password netra
+WORKDIR /app
+
+# Stage: dependencies
+FROM base AS deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Stage: production
+FROM base AS production
+COPY --from=deps /usr/local/lib/python3.11/dist-packages /usr/local/lib/python3.11/dist-packages
+COPY --from=deps /usr/local/bin /usr/local/bin
+
+COPY --chown=netra:netra . .
+
+USER netra
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD python -c "import httpx; httpx.get('http://localhost:8001/health').raise_for_status()"
+
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "2"]

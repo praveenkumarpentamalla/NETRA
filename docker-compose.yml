@@ -1,0 +1,470 @@
+version: '3.9'
+
+# ──────────────────────────────────────────────────────────────
+# Project NETRA — Docker Compose (Development)
+# ──────────────────────────────────────────────────────────────
+
+networks:
+  netra-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+  zookeeper_data:
+  minio_data:
+  milvus_data:
+  vault_data:
+  grafana_data:
+  prometheus_data:
+
+services:
+
+  # ── Infrastructure ─────────────────────────────────────────
+
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: netra-postgres
+    environment:
+      POSTGRES_USER: netra
+      POSTGRES_PASSWORD: netra_dev_password
+      POSTGRES_DB: netra_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d
+    networks:
+      - netra-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U netra -d netra_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: netra-redis
+    command: redis-server --requirepass netra_redis_dev --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - netra-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: netra-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    networks:
+      - netra-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: netra-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - netra-net
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: netra-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: netra-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    networks:
+      - netra-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: netra-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: netra_access_key
+      MINIO_ROOT_PASSWORD: netra_secret_key_dev
+    volumes:
+      - minio_data:/data
+    networks:
+      - netra-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  milvus:
+    image: milvusdb/milvus:v2.4.0
+    container_name: netra-milvus
+    command: milvus run standalone
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      - minio
+      - etcd
+    networks:
+      - netra-net
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: netra-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: >
+      etcd
+      --advertise-client-urls=http://127.0.0.1:2379
+      --listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    volumes:
+      - ./infrastructure/docker/etcd:/etcd
+    networks:
+      - netra-net
+
+  vault:
+    image: hashicorp/vault:1.16
+    container_name: netra-vault
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: netra-dev-token
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - vault_data:/vault/data
+    networks:
+      - netra-net
+
+  # ── Application Services ───────────────────────────────────
+
+  auth-service:
+    build:
+      context: ./services/auth
+      dockerfile: ../../infrastructure/docker/Dockerfile.nestjs
+    container_name: netra-auth
+    ports:
+      - "3001:3000"
+    environment:
+      NODE_ENV: development
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: netra
+      POSTGRES_PASSWORD: netra_dev_password
+      POSTGRES_DB: netra_db
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: netra_redis_dev
+      JWT_SECRET: dev-jwt-secret-replace-in-production-256bit
+      JWT_EXPIRES_IN: 1h
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - netra-net
+
+  camera-service:
+    build:
+      context: ./services/camera
+      dockerfile: ../../infrastructure/docker/Dockerfile.nestjs
+    container_name: netra-camera
+    ports:
+      - "3002:3000"
+    environment:
+      NODE_ENV: development
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: netra
+      POSTGRES_PASSWORD: netra_dev_password
+      POSTGRES_DB: netra_db
+      REDIS_HOST: redis
+      KAFKA_BROKERS: kafka:29092
+    depends_on:
+      - postgres
+      - kafka
+    networks:
+      - netra-net
+
+  event-service:
+    build:
+      context: ./services/event
+      dockerfile: ../../infrastructure/docker/Dockerfile.nestjs
+    container_name: netra-event
+    ports:
+      - "3003:3000"
+    environment:
+      NODE_ENV: development
+      POSTGRES_HOST: postgres
+      KAFKA_BROKERS: kafka:29092
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_ACCESS_KEY: netra_access_key
+      MINIO_SECRET_KEY: netra_secret_key_dev
+    depends_on:
+      - postgres
+      - kafka
+      - minio
+    networks:
+      - netra-net
+
+  watchlist-service:
+    build:
+      context: ./services/watchlist
+      dockerfile: ../../infrastructure/docker/Dockerfile.nestjs
+    container_name: netra-watchlist
+    ports:
+      - "3004:3000"
+    environment:
+      NODE_ENV: development
+      POSTGRES_HOST: postgres
+      KAFKA_BROKERS: kafka:29092
+      MILVUS_HOST: milvus
+      MILVUS_PORT: 19530
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: netra-dev-token
+    depends_on:
+      - postgres
+      - kafka
+      - milvus
+      - vault
+    networks:
+      - netra-net
+
+  investigation-service:
+    build:
+      context: ./services/investigation
+      dockerfile: ../../infrastructure/docker/Dockerfile.nestjs
+    container_name: netra-investigation
+    ports:
+      - "3005:3000"
+    environment:
+      NODE_ENV: development
+      POSTGRES_HOST: postgres
+      KAFKA_BROKERS: kafka:29092
+      MILVUS_HOST: milvus
+    depends_on:
+      - postgres
+      - kafka
+    networks:
+      - netra-net
+
+  audit-service:
+    build:
+      context: ./services/audit
+      dockerfile: ../../infrastructure/docker/Dockerfile.nestjs
+    container_name: netra-audit
+    ports:
+      - "3006:3000"
+    environment:
+      NODE_ENV: development
+      POSTGRES_HOST: postgres
+      KAFKA_BROKERS: kafka:29092
+    depends_on:
+      - postgres
+      - kafka
+    networks:
+      - netra-net
+
+  # ── AI Services ────────────────────────────────────────────
+
+  anpr-service:
+    build:
+      context: ./ai/anpr
+      dockerfile: ../../infrastructure/docker/Dockerfile.python-ai
+    container_name: netra-anpr
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./ai/models:/models:ro
+    networks:
+      - netra-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  face-recognition-service:
+    build:
+      context: ./ai/face-recognition
+      dockerfile: ../../infrastructure/docker/Dockerfile.python-ai
+    container_name: netra-fr
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./ai/models:/models:ro
+    networks:
+      - netra-net
+
+  reid-service:
+    build:
+      context: ./ai/person-reid
+      dockerfile: ../../infrastructure/docker/Dockerfile.python-ai
+    container_name: netra-reid
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./ai/models:/models:ro
+    networks:
+      - netra-net
+
+  audio-service:
+    build:
+      context: ./ai/audio
+      dockerfile: ../../infrastructure/docker/Dockerfile.python-ai
+    container_name: netra-audio
+    ports:
+      - "8004:8004"
+    volumes:
+      - ./ai/models:/models:ro
+    networks:
+      - netra-net
+
+  # ── Frontend ───────────────────────────────────────────────
+
+  pcr-console:
+    build:
+      context: ./apps/pcr-console
+      dockerfile: ../../infrastructure/docker/Dockerfile.nextjs
+    container_name: netra-pcr
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_API_URL: http://localhost:3001
+      NEXT_PUBLIC_MAP_STYLE: http://localhost:8090/styles/basic/style.json
+    depends_on:
+      - auth-service
+    networks:
+      - netra-net
+
+  # ── Tile server ────────────────────────────────────────────
+
+  tileserver:
+    image: maptiler/tileserver-gl:latest
+    container_name: netra-tiles
+    ports:
+      - "8090:8080"
+    volumes:
+      - ./infrastructure/docker/tiles:/data
+    networks:
+      - netra-net
+
+  # ── TURN server (for WebRTC live pull) ─────────────────────
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: netra-turn
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "5349:5349/tcp"
+    command: >
+      --listening-port=3478
+      --lt-cred-mech
+      --user=netra:netra_turn_dev
+      --realm=netra.local
+      --no-stdout-log
+    networks:
+      - netra-net
+
+  # ── Monitoring ─────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: netra-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+    networks:
+      - netra-net
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: netra-grafana
+    ports:
+      - "3010:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: netra_grafana_dev
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/netra-overview.json
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/monitoring/grafana:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    networks:
+      - netra-net
+
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: netra-loki
+    ports:
+      - "3100:3100"
+    networks:
+      - netra-net
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.96.0
+    container_name: netra-otel
+    volumes:
+      - ./infrastructure/monitoring/otel-config.yml:/etc/otel-config.yml:ro
+    command: ["--config=/etc/otel-config.yml"]
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    networks:
+      - netra-net

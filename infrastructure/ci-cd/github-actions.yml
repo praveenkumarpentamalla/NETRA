@@ -1,0 +1,289 @@
+name: NETRA CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com
+  EKS_CLUSTER_NAME: netra-production
+
+jobs:
+
+  # ── Lint & Type-check ────────────────────────────────────────
+
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run type-check
+
+  # ── Unit Tests ───────────────────────────────────────────────
+
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: netra_test
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: netra_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.2-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm run test -- --coverage --forceExit
+        env:
+          NODE_ENV: test
+          POSTGRES_HOST: localhost
+          POSTGRES_USER: netra_test
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: netra_test
+          REDIS_HOST: localhost
+          JWT_SECRET: test-jwt-secret-not-for-production
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # ── AI Model Tests ───────────────────────────────────────────
+
+  test-ai:
+    name: AI Module Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install AI dependencies
+        run: |
+          pip install -r ai/anpr/requirements.txt
+          pip install -r ai/face-recognition/requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Test ANPR service
+        run: pytest ai/anpr/tests/ -v
+
+      - name: Test Face Recognition service
+        run: pytest ai/face-recognition/tests/ -v
+
+      - name: Test calibration (ECE ≤ 0.05)
+        run: pytest ai/calibration/tests/ -v -k "test_ece"
+
+  # ── Security scan ────────────────────────────────────────────
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+
+      - name: Scan for secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+      - name: OWASP dependency check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'netra'
+          path: '.'
+          format: 'HTML'
+          args: '--failOnCVSS 7'
+
+  # ── Governance tests (gating KPIs) ───────────────────────────
+
+  test-governance:
+    name: Governance Red-Team Tests
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-ai]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test watchlist prohibited-category rejection
+        run: npm run test -- --testPathPattern="watchlist.redteam" --forceExit
+        env:
+          NODE_ENV: test
+
+      - name: Test two-officer rule enforcement
+        run: npm run test -- --testPathPattern="two-officer.redteam" --forceExit
+
+      - name: Test audit log tamper detection
+        run: npm run test -- --testPathPattern="audit.tamper" --forceExit
+
+      - name: Test revocation propagation (≤60s)
+        run: npm run test -- --testPathPattern="consent.revocation" --forceExit
+
+      - name: Test global archive Re-ID rejection
+        run: npm run test -- --testPathPattern="reid.global-archive" --forceExit
+
+  # ── Build & Push Docker images ───────────────────────────────
+
+  build-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-ai, security-scan, test-governance]
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service:
+          - { name: auth-service, context: services/auth, dockerfile: infrastructure/docker/Dockerfile.nestjs }
+          - { name: camera-service, context: services/camera, dockerfile: infrastructure/docker/Dockerfile.nestjs }
+          - { name: event-service, context: services/event, dockerfile: infrastructure/docker/Dockerfile.nestjs }
+          - { name: watchlist-service, context: services/watchlist, dockerfile: infrastructure/docker/Dockerfile.nestjs }
+          - { name: investigation-service, context: services/investigation, dockerfile: infrastructure/docker/Dockerfile.nestjs }
+          - { name: audit-service, context: services/audit, dockerfile: infrastructure/docker/Dockerfile.nestjs }
+          - { name: anpr-service, context: ai/anpr, dockerfile: infrastructure/docker/Dockerfile.python-ai }
+          - { name: fr-service, context: ai/face-recognition, dockerfile: infrastructure/docker/Dockerfile.python-ai }
+          - { name: reid-service, context: ai/person-reid, dockerfile: infrastructure/docker/Dockerfile.python-ai }
+          - { name: audio-service, context: ai/audio, dockerfile: infrastructure/docker/Dockerfile.python-ai }
+          - { name: pcr-console, context: apps/pcr-console, dockerfile: infrastructure/docker/Dockerfile.nextjs }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service.context }}
+          file: ${{ matrix.service.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/netra/${{ matrix.service.name }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/netra/${{ matrix.service.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+  # ── Deploy to EKS ────────────────────────────────────────────
+
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: build-push
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Update image tags
+        run: |
+          kustomize edit set image \
+            netra/auth-service=${{ env.ECR_REGISTRY }}/netra/auth-service:${{ github.sha }} \
+            netra/camera-service=${{ env.ECR_REGISTRY }}/netra/camera-service:${{ github.sha }}
+        working-directory: infrastructure/k8s/overlays/production
+
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -k infrastructure/k8s/overlays/production
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/auth-service -n netra --timeout=300s
+          kubectl rollout status deployment/camera-service -n netra --timeout=300s
+          kubectl rollout status deployment/pcr-console -n netra --timeout=300s
+
+      - name: Run smoke tests
+        run: |
+          kubectl run smoke-test \
+            --image=curlimages/curl:8.6.0 \
+            --restart=Never \
+            --rm \
+            -n netra \
+            --command -- sh -c "
+              curl -sf http://auth-service/health &&
+              curl -sf http://camera-service/health &&
+              echo 'Smoke tests passed'
+            "

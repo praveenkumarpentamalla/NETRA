@@ -1,0 +1,131 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: netra
+  labels:
+    name: netra
+    app.kubernetes.io/name: netra
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netra-config
+  namespace: netra
+data:
+  NODE_ENV: "production"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "netra_db"
+  POSTGRES_USER: "netra"
+  REDIS_PORT: "6379"
+  REDIS_TLS: "true"
+  KAFKA_BROKERS: "kafka-0.kafka-headless:9092,kafka-1.kafka-headless:9092,kafka-2.kafka-headless:9092"
+  KAFKA_SSL: "true"
+  MINIO_USE_SSL: "true"
+  MINIO_PORT: "9000"
+  MILVUS_PORT: "19530"
+  JWT_EXPIRES_IN: "1h"
+  JWT_REFRESH_EXPIRES_IN: "7d"
+  RATE_LIMIT_TTL: "60"
+  RATE_LIMIT_MAX: "100"
+  RETENTION_HOT_DAYS: "14"
+  RETENTION_WARM_DAYS: "90"
+  RETENTION_INDEX_DAYS: "365"
+  AUDIT_RETENTION_YEARS: "7"
+  CITIZEN_GEO_PRECISION_METRES: "25"
+  WATCHLIST_MAX_WANTED: "500"
+  WATCHLIST_MAX_MISSING: "1000"
+  WATCHLIST_MAX_BOLO: "500"
+  WATCHLIST_REVIEW_DAYS: "180"
+  FR_TOP_N_CANDIDATES: "5"
+  FR_MIN_AGE_ESTIMATE: "18"
+  FR_FALSE_MATCH_RATE_TARGET: "0.0001"
+  ANPR_CONFIDENCE_THRESHOLD: "0.7"
+  VAULT_ADDR: "https://vault.netra.svc:8200"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+---
+# Secret templates — actual values managed by Vault/External Secrets Operator
+# DO NOT commit actual secret values to git
+apiVersion: v1
+kind: Secret
+metadata:
+  name: netra-db-secret
+  namespace: netra
+  annotations:
+    kubernetes.io/secret-type: Opaque
+type: Opaque
+stringData:
+  host: "postgres.netra.svc"
+  # password injected by External Secrets Operator from Vault
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: netra-jwt-secret
+  namespace: netra
+type: Opaque
+stringData: {}  # injected from Vault
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: netra-redis-secret
+  namespace: netra
+type: Opaque
+stringData: {}  # injected from Vault
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: netra-minio-secret
+  namespace: netra
+type: Opaque
+stringData: {}  # injected from Vault
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: netra-backend
+  namespace: netra
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/netra-backend-role"
+---
+# Network Policy: deny all ingress by default; explicit allow
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: netra
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: netra
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: netra
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-controller
+  namespace: netra
+spec:
+  podSelector:
+    matchLabels:
+      app: pcr-console
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx

@@ -1,0 +1,1292 @@
+openapi: 3.1.0
+info:
+  title: Project NETRA API
+  version: 1.0.0
+  description: |
+    Networked Eyes for Tactical Response and Awareness.
+    Citizen-Consented, Camera-Agnostic, Hybrid Video-Intelligence Platform.
+    
+    **Governance rules enforced at API layer:**
+    - All investigation-scoped operations require valid `investigation_id`
+    - Face recognition requires officer attestation for every match
+    - Re-ID is investigation-bound — global archive search has no API path
+    - Watchlist operations require SENIOR_SP role
+    - All operations are audit-logged
+
+servers:
+  - url: https://api.netra.gov.in/v1
+    description: Production (India sovereign cloud)
+  - url: http://localhost:3000/v1
+    description: Local development
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Auth
+    description: Authentication and session management
+  - name: Citizen
+    description: Citizen camera management
+  - name: Camera
+    description: Camera registration and control
+  - name: Events
+    description: Event clips and analytics
+  - name: Alerts
+    description: Alert management
+  - name: Investigation
+    description: Investigation workflow
+  - name: Search
+    description: Investigation-scoped search
+  - name: Watchlist
+    description: Governed watchlist management
+  - name: LivePull
+    description: Authorized live pull sessions
+  - name: Audit
+    description: Audit logs and transparency
+  - name: Admin
+    description: System administration
+
+paths:
+
+  # ── Auth ────────────────────────────────────────────────────
+
+  /auth/citizen/otp/send:
+    post:
+      tags: [Auth]
+      summary: Send OTP to citizen phone
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone:
+                  type: string
+                  pattern: '^\+91\d{10}$'
+                  example: '+919876543210'
+      responses:
+        '200':
+          description: OTP sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: OTP sent
+        '429':
+          description: Too many requests (3 per minute limit)
+
+  /auth/citizen/otp/verify:
+    post:
+      tags: [Auth]
+      summary: Verify OTP and authenticate citizen
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, otp]
+              properties:
+                phone:
+                  type: string
+                  example: '+919876543210'
+                otp:
+                  type: string
+                  minLength: 6
+                  maxLength: 6
+                  example: '123456'
+      responses:
+        '200':
+          description: Tokens issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokens'
+        '401':
+          description: Invalid or expired OTP
+
+  /auth/officer/login:
+    post:
+      tags: [Auth]
+      summary: Officer login (username + password)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Tokens issued or MFA required
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/AuthTokens'
+                  - $ref: '#/components/schemas/MfaRequired'
+
+  /auth/officer/mfa/verify:
+    post:
+      tags: [Auth]
+      summary: Complete MFA verification
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mfaToken, totp]
+              properties:
+                mfaToken:
+                  type: string
+                totp:
+                  type: string
+                  minLength: 6
+                  maxLength: 6
+      responses:
+        '200':
+          description: Authentication complete
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokens'
+
+  # ── Cameras ─────────────────────────────────────────────────
+
+  /cameras:
+    post:
+      tags: [Camera]
+      summary: Register a new camera (citizen)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterCameraRequest'
+      responses:
+        '201':
+          description: Camera registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Camera'
+        '400':
+          description: Invalid FOV or configuration
+
+    get:
+      tags: [Camera]
+      summary: List citizen's cameras
+      responses:
+        '200':
+          description: Camera list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Camera'
+
+  /cameras/{cameraId}/revoke:
+    post:
+      tags: [Camera]
+      summary: Revoke camera (one-tap, propagates ≤60s)
+      parameters:
+        - $ref: '#/components/parameters/CameraId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                deletionDays:
+                  type: integer
+                  minimum: 0
+                  maximum: 90
+                  default: 30
+      responses:
+        '204':
+          description: Revocation initiated
+        '404':
+          description: Camera not found
+
+  /cameras/{cameraId}/pause:
+    post:
+      tags: [Camera]
+      summary: Pause camera (reversible)
+      parameters:
+        - $ref: '#/components/parameters/CameraId'
+      responses:
+        '204':
+          description: Camera paused
+
+  /cameras/{cameraId}/resume:
+    post:
+      tags: [Camera]
+      summary: Resume paused camera
+      parameters:
+        - $ref: '#/components/parameters/CameraId'
+      responses:
+        '204':
+          description: Camera resumed
+
+  /cameras/{cameraId}/consent:
+    put:
+      tags: [Camera]
+      summary: Update camera consent settings
+      parameters:
+        - $ref: '#/components/parameters/CameraId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateConsentRequest'
+      responses:
+        '200':
+          description: Consent updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Camera'
+
+  /cameras/{cameraId}/privacy-zones:
+    put:
+      tags: [Camera]
+      summary: Update privacy zones (propagates to Bridge Agent ≤60s)
+      parameters:
+        - $ref: '#/components/parameters/CameraId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [zones]
+              properties:
+                zones:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/PrivacyZone'
+      responses:
+        '200':
+          description: Privacy zones updated
+
+  # ── Events ──────────────────────────────────────────────────
+
+  /events:
+    get:
+      tags: [Events]
+      summary: List events (PCR — scoped to investigation or camera)
+      parameters:
+        - name: investigationId
+          in: query
+          schema:
+            type: string
+        - name: cameraId
+          in: query
+          schema:
+            type: string
+        - name: eventType
+          in: query
+          schema:
+            type: string
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Event list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Event'
+                  total:
+                    type: integer
+
+  /events/{eventId}/clip:
+    get:
+      tags: [Events]
+      summary: Get pre-signed URL for clip playback
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pre-signed URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+                  expiresAt:
+                    type: string
+                    format: date-time
+
+  # ── Alerts ──────────────────────────────────────────────────
+
+  /alerts:
+    get:
+      tags: [Alerts]
+      summary: List alerts (PCR)
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [NEW, ACKNOWLEDGED, INVESTIGATING, RESOLVED, DISMISSED]
+        - name: alertType
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Alert list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Alert'
+                  total:
+                    type: integer
+
+  /alerts/{alertId}/acknowledge:
+    post:
+      tags: [Alerts]
+      summary: Acknowledge an alert
+      parameters:
+        - name: alertId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Alert acknowledged
+
+  /alerts/{alertId}/attest:
+    post:
+      tags: [Alerts]
+      summary: Attest a face/ANPR match (mandatory for FR matches)
+      description: |
+        Officer must visually verify the match before attestation.
+        Every attestation is audit-logged with officer ID and timestamp.
+      parameters:
+        - name: alertId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [candidateRank, note]
+              properties:
+                candidateRank:
+                  type: integer
+                  minimum: 1
+                  maximum: 5
+                note:
+                  type: string
+                  description: Officer's attestation note (mandatory)
+      responses:
+        '200':
+          description: Attestation recorded
+        '403':
+          description: Attestation required — cannot bypass
+
+  # ── Investigations ───────────────────────────────────────────
+
+  /investigations:
+    post:
+      tags: [Investigation]
+      summary: Create a new investigation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInvestigationRequest'
+      responses:
+        '201':
+          description: Investigation created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Investigation'
+
+    get:
+      tags: [Investigation]
+      summary: List investigations (officer's own or all for supervisor)
+      responses:
+        '200':
+          description: Investigation list
+
+  /investigations/{investigationId}/cameras:
+    post:
+      tags: [Investigation]
+      summary: Add camera to investigation scope
+      parameters:
+        - $ref: '#/components/parameters/InvestigationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cameraId]
+              properties:
+                cameraId:
+                  type: string
+      responses:
+        '200':
+          description: Camera added to scope
+
+  # ── Search ──────────────────────────────────────────────────
+
+  /investigations/{investigationId}/search/attribute:
+    post:
+      tags: [Search]
+      summary: Search by attribute (vehicle/clothing description)
+      description: Searches metadata index within investigation scope
+      parameters:
+        - $ref: '#/components/parameters/InvestigationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttributeSearchRequest'
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResults'
+
+  /investigations/{investigationId}/search/plate:
+    post:
+      tags: [Search]
+      summary: Search by number plate (fuzzy matching)
+      parameters:
+        - $ref: '#/components/parameters/InvestigationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plateString]
+              properties:
+                plateString:
+                  type: string
+                  example: 'MH01AB1234'
+                fuzzyTolerance:
+                  type: integer
+                  default: 1
+                  description: Max character edit distance for OCR error correction
+      responses:
+        '200':
+          description: Plate search results
+
+  /investigations/{investigationId}/search/face:
+    post:
+      tags: [Search]
+      summary: Search by face crop (governed — officer attestation required)
+      description: |
+        Recognition runs only against the investigation's camera scope.
+        Returns top-5 candidates with calibrated probabilities.
+        Officer attestation is mandatory for any match.
+        Children excluded from recognition output.
+      parameters:
+        - $ref: '#/components/parameters/InvestigationId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [faceCrop]
+              properties:
+                faceCrop:
+                  type: string
+                  format: binary
+                useWatchlist:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Face search results with top-5 candidates
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FaceSearchResults'
+        '403':
+          description: Not authorised for face recognition
+
+  /investigations/{investigationId}/search/reid:
+    post:
+      tags: [Search]
+      summary: Person Re-ID search (investigation-bound)
+      description: |
+        Re-ID strictly scoped to investigation cameras + time window.
+        Global archive Re-ID has no API path — structurally prohibited.
+      parameters:
+        - $ref: '#/components/parameters/InvestigationId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [personCrop]
+              properties:
+                personCrop:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Re-ID candidates
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReIDResults'
+
+  # ── Watchlist ────────────────────────────────────────────────
+
+  /watchlist:
+    post:
+      tags: [Watchlist]
+      summary: Add watchlist entry (SENIOR_SP only)
+      description: |
+        Requires SENIOR_SP role.
+        Prohibited categories enforced at API layer (no API path for political/religious/caste/journalist).
+        Mandatory expiry ≤ 180 days.
+        Two-officer rule for sensitive operations.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddWatchlistEntryRequest'
+      responses:
+        '201':
+          description: Watchlist entry created
+        '403':
+          description: Insufficient role or prohibited category detected
+        '400':
+          description: Invalid governance fields
+
+    get:
+      tags: [Watchlist]
+      summary: List watchlist entries (SENIOR_SP / AUDITOR)
+      responses:
+        '200':
+          description: Watchlist entries
+
+  /watchlist/{entryId}/review:
+    post:
+      tags: [Watchlist]
+      summary: Review and re-affirm watchlist entry (extends by 180 days)
+      parameters:
+        - name: entryId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [note]
+              properties:
+                note:
+                  type: string
+      responses:
+        '200':
+          description: Entry reviewed and extended
+
+  /watchlist/{entryId}/remove:
+    post:
+      tags: [Watchlist]
+      summary: Remove watchlist entry (two-officer rule)
+      parameters:
+        - name: entryId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason, cosignerId]
+              properties:
+                reason:
+                  type: string
+                cosignerId:
+                  type: string
+                  description: Second officer ID (two-officer rule — must differ from actor)
+      responses:
+        '204':
+          description: Entry removed
+        '403':
+          description: Two-officer rule violation
+
+  # ── Live Pull ────────────────────────────────────────────────
+
+  /live-pull/request:
+    post:
+      tags: [LivePull]
+      summary: Request a live pull session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LivePullRequest'
+      responses:
+        '201':
+          description: Live pull session created (may be pending approval)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LivePullSession'
+
+  /live-pull/{sessionId}/approve:
+    post:
+      tags: [LivePull]
+      summary: Supervisor approval for Tier-2 live pull
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Approved — tunnel opening
+
+  # ── Audit ───────────────────────────────────────────────────
+
+  /audit/logs:
+    get:
+      tags: [Audit]
+      summary: Query audit logs (AUDITOR role)
+      parameters:
+        - name: action
+          in: query
+          schema:
+            type: string
+        - name: actorId
+          in: query
+          schema:
+            type: string
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+      responses:
+        '200':
+          description: Audit log entries
+
+  /audit/verify/{logUuid}:
+    get:
+      tags: [Audit]
+      summary: Verify hash chain integrity for a log entry
+      parameters:
+        - name: logUuid
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Hash chain verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid:
+                    type: boolean
+                  logUuid:
+                    type: string
+                  computedHash:
+                    type: string
+                  storedHash:
+                    type: string
+
+  /audit/transparency/public:
+    get:
+      tags: [Audit]
+      summary: Public transparency dashboard (de-identified aggregate stats)
+      security: []
+      responses:
+        '200':
+          description: Aggregate statistics (de-identified)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransparencyStats'
+
+# ──────────────────────────────────────────────────────────────
+# COMPONENTS
+# ──────────────────────────────────────────────────────────────
+
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    CameraId:
+      name: cameraId
+      in: path
+      required: true
+      schema:
+        type: string
+    InvestigationId:
+      name: investigationId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+
+    AuthTokens:
+      type: object
+      properties:
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+        isNewUser:
+          type: boolean
+
+    MfaRequired:
+      type: object
+      properties:
+        requiresMfa:
+          type: boolean
+          example: true
+        mfaToken:
+          type: string
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          minLength: 8
+
+    Camera:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        cameraId:
+          type: string
+          description: Pseudonymous ID (shown to PCR)
+        label:
+          type: string
+        cameraClass:
+          type: string
+          enum: [ONVIF, RTSP, VENDOR_CLOUD, DVR_NVR, PHONE_CAMERA, DASHCAM, USB_WEBCAM]
+        status:
+          type: string
+          enum: [PENDING, ONLINE, OFFLINE, PAUSED, REVOKED, ERROR]
+        geoPoint:
+          $ref: '#/components/schemas/GeoPoint'
+        geoPrecisionM:
+          type: integer
+          description: Geo precision floor in metres
+        addressArea:
+          type: string
+        consentMode:
+          type: string
+          enum: [EVENT_ONLY, LIVE_PULL_ENABLED]
+        livePullAuth:
+          type: string
+          enum: [ALWAYS_DENY, ASK_EACH_TIME, AUTO_ALLOW_EMERGENCY]
+        awayModeEnabled:
+          type: boolean
+        lastSeenAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+
+    RegisterCameraRequest:
+      type: object
+      required: [cameraClass, fovImagePolygon, streamConfig]
+      properties:
+        label:
+          type: string
+        cameraClass:
+          type: string
+          enum: [ONVIF, RTSP, VENDOR_CLOUD, DVR_NVR, PHONE_CAMERA, DASHCAM, USB_WEBCAM]
+        geoPoint:
+          $ref: '#/components/schemas/GeoPoint'
+        geoPrecisionM:
+          type: integer
+          default: 25
+        fovImagePolygon:
+          type: array
+          items:
+            $ref: '#/components/schemas/PixelPoint'
+        addressArea:
+          type: string
+        streamConfig:
+          type: object
+          description: Camera credentials (encrypted by KMS on server)
+        consentMode:
+          type: string
+          enum: [EVENT_ONLY, LIVE_PULL_ENABLED]
+          default: EVENT_ONLY
+        livePullAuth:
+          type: string
+          enum: [ALWAYS_DENY, ASK_EACH_TIME, AUTO_ALLOW_EMERGENCY]
+          default: ASK_EACH_TIME
+        privacyZones:
+          type: array
+          items:
+            $ref: '#/components/schemas/PrivacyZone'
+
+    PrivacyZone:
+      type: object
+      required: [pixelPolygon]
+      properties:
+        label:
+          type: string
+        pixelPolygon:
+          type: array
+          items:
+            $ref: '#/components/schemas/PixelPoint'
+          minItems: 3
+
+    PixelPoint:
+      type: object
+      required: [x, y]
+      properties:
+        x:
+          type: integer
+        y:
+          type: integer
+
+    GeoPoint:
+      type: object
+      required: [lat, lng]
+      properties:
+        lat:
+          type: number
+        lng:
+          type: number
+
+    UpdateConsentRequest:
+      type: object
+      properties:
+        consentMode:
+          type: string
+          enum: [EVENT_ONLY, LIVE_PULL_ENABLED]
+        livePullAuth:
+          type: string
+          enum: [ALWAYS_DENY, ASK_EACH_TIME, AUTO_ALLOW_EMERGENCY]
+        awayModeEnabled:
+          type: boolean
+        awaySchedule:
+          type: object
+          properties:
+            start:
+              type: string
+              example: '22:00'
+            end:
+              type: string
+              example: '06:00'
+            days:
+              type: array
+              items:
+                type: integer
+                minimum: 0
+                maximum: 6
+        alertSubscriptions:
+          type: array
+          items:
+            type: string
+
+    Event:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        cameraId:
+          type: string
+        eventType:
+          type: string
+        occurredAt:
+          type: string
+          format: date-time
+        clipHash:
+          type: string
+        clipSizeBytes:
+          type: integer
+        triggerConfidence:
+          type: number
+        edgeDetections:
+          type: array
+          items:
+            type: object
+        legalHold:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    Alert:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        alertType:
+          type: string
+        status:
+          type: string
+        title:
+          type: string
+        confidence:
+          type: number
+        matchCandidates:
+          type: array
+          description: Top-N candidates (never single match)
+          items:
+            $ref: '#/components/schemas/WatchlistCandidate'
+        createdAt:
+          type: string
+          format: date-time
+
+    WatchlistCandidate:
+      type: object
+      properties:
+        rank:
+          type: integer
+          minimum: 1
+          maximum: 5
+        watchlistEntryId:
+          type: string
+        calibratedProbability:
+          type: number
+        similarityScore:
+          type: number
+        category:
+          type: string
+
+    CreateInvestigationRequest:
+      type: object
+      required: [caseReference, investigationType, title, timeWindowStart]
+      properties:
+        caseReference:
+          type: string
+          example: 'FIR/MH/2026/001234'
+        investigationType:
+          type: string
+          enum: [FIR, PCR_CALL, MISSING_PERSON, BOLO]
+        title:
+          type: string
+        description:
+          type: string
+        timeWindowStart:
+          type: string
+          format: date-time
+        timeWindowEnd:
+          type: string
+          format: date-time
+        geoFence:
+          type: object
+          description: GeoJSON Polygon bounding investigation area
+
+    Investigation:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        caseReference:
+          type: string
+        investigationType:
+          type: string
+        title:
+          type: string
+        status:
+          type: string
+          enum: [OPEN, CLOSED, SUSPENDED, ARCHIVED]
+        openedAt:
+          type: string
+          format: date-time
+
+    AttributeSearchRequest:
+      type: object
+      properties:
+        vehicleDesc:
+          type: string
+          example: 'red SUV'
+        clothingDesc:
+          type: string
+          example: 'white shirt'
+        eventTypes:
+          type: array
+          items:
+            type: string
+        timeStart:
+          type: string
+          format: date-time
+        timeEnd:
+          type: string
+          format: date-time
+        limit:
+          type: integer
+          default: 50
+
+    SearchResults:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+        total:
+          type: integer
+        searchId:
+          type: string
+          description: Audit reference for this search
+
+    FaceSearchResults:
+      type: object
+      properties:
+        detections:
+          type: array
+          items:
+            type: object
+        recognitionResults:
+          type: array
+          items:
+            type: object
+            properties:
+              candidates:
+                type: array
+                description: Always top-5, never single match
+                items:
+                  $ref: '#/components/schemas/WatchlistCandidate'
+              requiresAttestation:
+                type: boolean
+                example: true
+        governanceNote:
+          type: string
+          example: 'Officer attestation required before any downstream action'
+
+    ReIDResults:
+      type: object
+      properties:
+        candidates:
+          type: array
+          items:
+            type: object
+            properties:
+              rank:
+                type: integer
+              eventId:
+                type: string
+              cameraId:
+                type: string
+              occurredAt:
+                type: string
+                format: date-time
+              similarity:
+                type: number
+        scopeNote:
+          type: string
+          example: 'Results scoped to investigation cameras and time window only'
+
+    AddWatchlistEntryRequest:
+      type: object
+      required: [category, reference]
+      properties:
+        category:
+          type: string
+          enum: [WANTED, MISSING, BOLO_SUSPECT]
+        reference:
+          type: string
+          description: FIR number / NCMC reference / investigation reference
+          example: 'FIR/MH/2026/001234'
+        description:
+          type: string
+          description: Entry description (prohibited category check enforced)
+        expiryAt:
+          type: string
+          format: date-time
+          description: Max 180 days from approval
+        faceEmbedding:
+          type: string
+          format: byte
+          description: Face image (base64) for biometric template creation
+
+    LivePullRequest:
+      type: object
+      required: [cameraId, caseReference, tier]
+      properties:
+        cameraId:
+          type: string
+        caseReference:
+          type: string
+        tier:
+          type: string
+          enum: [TIER_1, TIER_2, TIER_3]
+          description: |
+            TIER_1: active 112/pursuit/abduction — pre-authorised ≤15min
+            TIER_2: registered FIR — supervisor approval required
+            TIER_3: intelligence-led — Senior SP required
+        investigationId:
+          type: string
+        maxDurationSeconds:
+          type: integer
+          default: 900
+
+    LivePullSession:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [REQUESTED, PENDING_APPROVAL, PENDING_CITIZEN, ACTIVE, COMPLETED, DENIED, TIMEOUT]
+        tier:
+          type: string
+        watermarkId:
+          type: string
+        webrtcOffer:
+          type: string
+          description: SDP offer for WebRTC connection (when ACTIVE)
+        startedAt:
+          type: string
+          format: date-time
+
+    TransparencyStats:
+      type: object
+      description: De-identified aggregate statistics for public transparency
+      properties:
+        reportPeriod:
+          type: string
+          example: '2026-Q1'
+        totalActiveCameras:
+          type: integer
+        camerasByArea:
+          type: array
+          items:
+            type: object
+            properties:
+              area:
+                type: string
+              count:
+                type: integer
+        alertVolumes:
+          type: object
+          additionalProperties:
+            type: integer
+        searchVolumes:
+          type: object
+          properties:
+            attribute:
+              type: integer
+            plate:
+              type: integer
+            face:
+              type: integer
+            reid:
+              type: integer
+        watchlistSizes:
+          type: object
+          additionalProperties:
+            type: integer
+        frFalsePositiveRate:
+          type: number
+        livePullSessions:
+          type: integer
+        livePullByTier:
+          type: object
+          additionalProperties:
+            type: integer
+        publishedAt:
+          type: string
+          format: date-time
